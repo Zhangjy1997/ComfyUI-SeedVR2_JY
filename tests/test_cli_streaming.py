@@ -23,7 +23,7 @@ import unittest
 from unittest.mock import patch
 
 from src.cli.multi_gpu import (
-    plan_segments, process_multi_gpu_video, run_segment_workers, segment_output_path,
+    plan_segments, plan_gpu_segments, process_multi_gpu_video, run_segment_workers, segment_output_path,
 )
 
 
@@ -35,6 +35,21 @@ def fake_segment(segment, config, state):
         "device": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }))
     return segment.frame_count
+
+
+def synchronized_segment(segment, config, state):
+    """Require every assigned GPU to start, and the previous window to be saved."""
+    root = Path(config["work_dir"])
+    window = segment.index // 8
+    if window and not (root / f"window_{window - 1}.saved").exists():
+        raise RuntimeError("Next minute started before previous minute was saved")
+    (root / f"started_{segment.index}").touch()
+    deadline = time.monotonic() + 10
+    while not all((root / f"started_{window * 8 + i}").exists() for i in range(8)):
+        if time.monotonic() > deadline:
+            raise RuntimeError("Not all eight GPU workers received their task")
+        time.sleep(0.01)
+    return fake_segment(segment, config, state)
 
 
 def failing_segment(segment, config, state):
@@ -120,6 +135,33 @@ class PlanningTests(unittest.TestCase):
                     self.assertLessEqual(s.end, s.read_end)
                     self.assertLessEqual(s.read_end, 17 + count)
 
+    def test_each_minute_is_split_across_eight_gpus(self):
+        windows = plan_segments(0, 9000, 30, 60, 16)
+        groups = plan_gpu_segments(windows, 8, 16)
+        self.assertEqual(len(groups), 5)
+        self.assertTrue(all(len(group) == 8 for group in groups))
+        self.assertTrue(all(s.frame_count == 225 for group in groups for s in group))
+        self.assertEqual(groups[0][1].read_start, 225 - 16)
+        self.assertEqual(groups[1][0].read_start, 1800 - 16)
+        self.assertEqual(groups[-1][-1].read_end, 9000)
+        self.assertEqual([s.index for g in groups for s in g], list(range(40)))
+
+    def test_short_window_and_uneven_gpu_shares_preserve_frame_ranges(self):
+        for count in (1, 7, 8, 19, 43):
+            windows = plan_segments(17, count, 10, 2, 4)
+            groups = plan_gpu_segments(windows, 8, 4)
+            flattened = [s for group in groups for s in group]
+            self.assertEqual([f for s in flattened for f in range(s.start, s.end)],
+                             list(range(17, 17 + count)))
+            for window, group in zip(windows, groups):
+                self.assertEqual(len(group), min(8, window.frame_count))
+                self.assertLessEqual(max(s.frame_count for s in group) -
+                                     min(s.frame_count for s in group), 1)
+                for shard in group:
+                    self.assertGreater(shard.frame_count, 0)
+                    self.assertGreaterEqual(shard.read_start, 17)
+                    self.assertLessEqual(shard.read_end, 17 + count)
+
     def test_empty_and_invalid_parameters(self):
         self.assertEqual(plan_segments(0, 0, 30), [])
         for duration in (0, -1, float("nan"), float("inf")):
@@ -133,7 +175,7 @@ class PlanningTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
-    def test_dynamic_queue_reuses_workers_and_restores_environment(self):
+    def test_rounds_reuse_workers_and_restore_environment(self):
         segments = plan_segments(0, 70, 10, 1)
         with tempfile.TemporaryDirectory() as directory:
             progress = []
@@ -146,9 +188,49 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(count, 70)
             self.assertEqual(sorted(progress), list(range(7)))
             records = [json.loads(p.read_text()) for p in Path(directory).glob("*.json")]
-            self.assertLessEqual(len({r["pid"] for r in records}), 2)
+            self.assertEqual(len(records), 14)
+            self.assertEqual(len({r["pid"] for r in records}), 2)
             self.assertTrue(any(r["count"] > 1 for r in records))
-            self.assertLessEqual({r["device"] for r in records}, {"2", "4"})
+            self.assertEqual({r["device"] for r in records}, {"2", "4"})
+
+    def test_all_eight_workers_participate_in_every_round_and_reuse_state(self):
+        windows = plan_segments(0, 40, 10, 2, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            finalized = []
+
+            def save_window(window, group):
+                self.assertEqual(len(group), 8)
+                self.assertTrue(all((root / f"{s.index}.json").exists() for s in group))
+                self.assertFalse((root / f"started_{group[-1].index + 1}").exists())
+                (root / f"window_{window.index}.saved").touch()
+                finalized.append(window.index)
+
+            result = run_segment_workers(
+                windows, [str(i) for i in range(8)], synchronized_segment,
+                {"work_dir": directory}, on_window_complete=save_window,
+            )
+            self.assertEqual(result, 40)
+            self.assertEqual(finalized, [0, 1])
+            for slot in range(8):
+                first = json.loads((root / f"{slot}.json").read_text())
+                second = json.loads((root / f"{slot + 8}.json").read_text())
+                self.assertEqual(first["device"], str(slot))
+                self.assertEqual(first["pid"], second["pid"])
+                self.assertEqual((first["count"], second["count"]), (1, 2))
+
+    def test_window_merge_failure_does_not_start_next_window(self):
+        windows = plan_segments(0, 40, 10, 2)
+        with tempfile.TemporaryDirectory() as directory:
+            def fail_merge(window, group):
+                raise RuntimeError("merge stopped")
+
+            with self.assertRaisesRegex(RuntimeError, "merge stopped"):
+                run_segment_workers(windows, ["0", "1"], fake_segment,
+                                    {"work_dir": directory}, on_window_complete=fail_merge)
+            self.assertEqual(sorted(p.name for p in Path(directory).glob("*.json")),
+                             ["0.json", "1.json"])
+            self.assertEqual(mp.active_children(), [])
 
     def test_worker_errors_and_hard_crashes_do_not_hang(self):
         segments = plan_segments(0, 10, 10, 1)

@@ -319,7 +319,7 @@ We're actively working on improvements and new features. To stay informed:
 
 ### Performance Features
 - **torch.compile Integration**: Optional 20-40% DiT speedup and 15-25% VAE speedup with PyTorch 2.0+ compilation
-- **Multi-GPU CLI**: Schedule video segments across persistent GPU workers, encode incrementally, and merge encoded files with FFmpeg
+- **Multi-GPU CLI**: Split each time window across all selected GPUs, encode incrementally, and save that window before processing the next
 - **Model Caching**: Keep models loaded between generations for single-GPU directory processing or multi-GPU streaming
 - **Flexible Attention Backends**: Choose between PyTorch SDPA (stable, always available), Flash Attention 2/3, or SageAttention 2/3 for faster computation on supported hardware
 
@@ -912,8 +912,8 @@ python inference_cli.py media_folder/ \
 - `--skip_first_frames`: Skip N initial frames (default: 0)
 - `--load_cap`: Maximum total frames to load from video. 0 = load all (default: 0)
 - `--chunk_size`: New frames per inference chunk, written before processing the next chunk. In single-GPU mode, 0 loads the whole video. In multi-GPU mode, 0 automatically uses `max(33, batch_size)`; an explicit positive value overrides this. Context and prepend frames add to the inference input size.
-- `--segment_duration`: Multi-GPU task length in seconds (default: 60). Each task encodes a video segment incrementally; this does not determine how many frames are held in RAM.
-- `--segment_overlap`: Extra input context frames on each side of a multi-GPU segment (default: 4). These are cropped before encoding. This is context-and-trim, not cross-segment output blending.
+- `--segment_duration`: Time-window length in seconds (default: 60). Every window is split across all selected GPUs, encoded incrementally and assembled before the next window starts.
+- `--segment_overlap`: Extra input context frames at GPU subsegment and time-window boundaries (default: 4). These are cropped before encoding. This is context-and-trim, not cross-segment output blending.
 - `--prepend_frames`: Prepend N reversed frames to reduce start artifacts (auto-removed) (default: 0)
 - `--temporal_overlap`: Overlap for batch blending within an inference chunk and input context between chunks (default: 0). Segment context is controlled separately by `--segment_overlap`.
 
@@ -961,13 +961,15 @@ python inference_cli.py media_folder/ \
 
 ### Multi-GPU Processing Explained
 
-Multi-GPU video processing uses persistent workers and encoded segment files:
+Multi-GPU video processing uses sequential time windows with all GPUs working within each window:
 
-1. Plan disjoint output ranges of `--segment_duration` seconds (default: 60).
-2. Add up to `--segment_overlap` context frames before and after each range, bounded by the selected input range.
-3. Each GPU takes a task, reads at most `--chunk_size` new frames at a time, upscales them, crops context, and immediately writes the retained frames to a segment file.
-4. A finished GPU takes the next task. With `--cache_dit --cache_vae`, its models are reused across chunks and tasks within the same input video.
-5. FFmpeg concatenates the encoded segments in order using video stream copy. Source audio from the selected time range is included and encoded as AAC when present.
+1. Plan disjoint output windows of `--segment_duration` seconds (default: 60).
+2. Split each window's frames evenly across **all selected GPUs**, with `--segment_overlap` extra context frames on either side of each GPU's range.
+3. Each GPU reads at most `--chunk_size` new frames at a time, upscales them, crops context, and writes the retained frames to its own video file.
+4. Wait for all GPUs, then stream-copy their files into one video for this window. Delete those component files and dispatch the next window to the same GPU workers. With `--cache_dit --cache_vae`, model caches survive between windows.
+5. After all windows finish, concatenate the window videos using stream copy. Include source audio from the selected time range, encoded as AAC when present.
+
+For a 60-second, 30 FPS window on eight GPUs: 1,800 frames are split into eight ranges of 225 frames, plus context. `--chunk_size 180` processes each GPU's share in smaller chunks; `--batch_size 9` controls model batches inside those chunks. A five-minute video runs five such eight-GPU rounds, not five single-GPU tasks.
 
 Only frame ranges and completion metadata cross process queues. Workers never accumulate all output chunks, and the parent never receives a complete video tensor. Frame format conversion uses one frame at a time. Peak tensor memory depends on active workers, inference chunk size, resolution, context, and model settings, rather than video duration. Encoded files and filesystem cache still consume disk space / system resources.
 
@@ -975,8 +977,8 @@ Only frame ranges and completion metadata cross process queues. Workers never ac
 
 - MP4 output requires `ffmpeg` in PATH even when segment encoding uses `--video_backend opencv`. PNG output does not require FFmpeg.
 - Each GPU loads its own models. Use fewer devices or a smaller `--chunk_size` to lower aggregate RAM usage.
-- At most one task runs per selected GPU. A video shorter than `--segment_duration` creates one task; reduce the duration to distribute a short clip across more GPUs.
-- `--batch_size` remains the model's internal frame batch size. `--chunk_size` controls the amount processed before writing, and `--segment_duration` controls scheduling / file boundaries.
+- Every window, including a clip shorter than `--segment_duration`, uses all selected GPUs when it has enough frames. Only a window with fewer frames than GPUs uses fewer workers. Each round waits for its slowest worker and its video merge; continuous 100% utilization is not guaranteed.
+- `--batch_size` remains the model's internal frame batch size. `--chunk_size` controls the amount processed before writing, and `--segment_duration` controls the outer all-GPU round / video file boundaries.
 - Segment context is cropped, not blended. No frames are duplicated at joins, but independently generated segments may still show a visual change. Test boundary quality on your footage.
 - Input timing follows the existing OpenCV constant-FPS pipeline; variable-frame-rate timestamps are not preserved.
 - Temporary `.seedvr2-segments-*` directories sit beside the output. Allow disk space for both the encoded segments and final video. On success they are removed; on failure they are retained with a frame-range manifest and diagnostics. Automatic resume is not implemented.

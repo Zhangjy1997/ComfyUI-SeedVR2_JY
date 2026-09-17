@@ -7,7 +7,7 @@ Supports single and multi-GPU processing with advanced memory optimization.
 
 Key Features:
     • Multi-GPU Processing: Persistent workers encode video segments directly to disk,
-      using cropped context frames at segment boundaries
+      using all GPUs within each time window and cropped boundary context
     • Streaming Mode: Memory-efficient processing of long videos in chunks, avoiding
       full video loading into RAM while maintaining temporal consistency
     • Memory Optimization: BlockSwap for limited VRAM, VAE tiling for large resolutions,
@@ -511,8 +511,14 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         # Multi-GPU workers encode bounded chunks directly into segment files.
         if len(device_list) > 1:
             cap.release()
+            debug.log(
+                f"Multi-GPU rounds: {args.segment_duration:g}s per round, "
+                f"up to {len(device_list)} GPUs in every round, "
+                f"chunk_size={args.chunk_size or max(33, args.batch_size)} per GPU",
+                category="generation", force=True,
+            )
             def segment_progress(completed, total, index):
-                debug.log(f"Segment {index + 1} saved ({completed}/{total} complete)",
+                debug.log(f"Window {index + 1} saved ({completed}/{total} complete)",
                           category="generation", force=True)
 
             frames_written = process_multi_gpu_video(
@@ -1034,7 +1040,8 @@ def _process_video_segment(segment, config, state) -> int:
         if segment.read_start and not cap.set(cv2.CAP_PROP_POS_FRAMES, segment.read_start):
             raise RuntimeError(f"Cannot seek to frame {segment.read_start}")
         worker_debug.log(
-            f"Segment {segment.index + 1}: output frames {segment.start}-{segment.end}, "
+            f"GPU {os.environ.get('CUDA_VISIBLE_DEVICES', '0')}, subsegment {segment.index + 1}: "
+            f"output frames {segment.start}-{segment.end}, "
             f"read {segment.read_start}-{segment.read_end}, chunk_size={chunk_size}",
             category="generation", force=True,
         )
@@ -1198,10 +1205,10 @@ Examples:
                              "memory-bounded chunks of N frames. 0 = whole video on single GPU; "
                              "multi-GPU automatically uses max(33, batch_size) (default: 0)")
     process_group.add_argument("--segment_duration", type=float, default=60.0,
-                        help="Multi-GPU task duration in seconds (default: 60). Each task streams "
-                             "chunk_size frames at a time into an encoded segment on disk.")
+                        help="Time window in seconds (default: 60). Every window is split across all "
+                             "selected GPUs and saved before starting the next window.")
     process_group.add_argument("--segment_overlap", type=int, default=4,
-                        help="Extra input context frames on each side of multi-GPU segments "
+                        help="Extra context frames at GPU subsegment and time-window boundaries "
                              "(default: 4). Cropped before encoding; no cross-segment blending.")
     process_group.add_argument("--prepend_frames", type=int, default=0,
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
