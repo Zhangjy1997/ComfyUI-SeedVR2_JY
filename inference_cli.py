@@ -6,8 +6,8 @@ Command-line interface for high-quality upscaling using SeedVR2 diffusion models
 Supports single and multi-GPU processing with advanced memory optimization.
 
 Key Features:
-    • Multi-GPU Processing: Automatic workload distribution across multiple GPUs with
-      temporal overlap blending for seamless transitions
+    • Multi-GPU Processing: Persistent workers encode video segments directly to disk,
+      using cropped context frames at segment boundaries
     • Streaming Mode: Memory-efficient processing of long videos in chunks, avoiding
       full video loading into RAM while maintaining temporal consistency
     • Memory Optimization: BlockSwap for limited VRAM, VAE tiling for large resolutions,
@@ -49,6 +49,7 @@ import os
 import argparse
 import time
 import platform
+import math
 import multiprocessing as mp
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
@@ -112,6 +113,7 @@ import subprocess
 import shutil
 
 # Project imports
+from src.cli.multi_gpu import process_multi_gpu_video, segment_output_path
 from src.utils.downloads import download_weight
 from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE
 from src.utils.constants import SEEDVR2_FOLDER_NAME
@@ -120,7 +122,6 @@ from src.core.generation_utils import (
     prepare_runner, 
     compute_generation_info, 
     log_generation_start,
-    blend_overlapping_frames,
     load_text_embeddings,
     script_directory
 )
@@ -200,13 +201,10 @@ class FFMPEGVideoWriter:
             
             self.proc.wait()
             
-            if self.proc.returncode != 0:
-                debug.log(
-                    f"ffmpeg exited with code {self.proc.returncode}. "
-                    "Check output file for corruption.",
-                    level="WARNING", force=True, category="file"
-                )
+            returncode = self.proc.returncode
             self.proc = None
+            if returncode != 0:
+                raise RuntimeError(f"ffmpeg encoder exited with code {returncode}")
 
 
 # =============================================================================
@@ -510,27 +508,19 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         chunk_idx = 0
         base_name = Path(input_path).stem
         
-        # Multi-GPU: workers stream their own segments
+        # Multi-GPU workers encode bounded chunks directly into segment files.
         if len(device_list) > 1:
-            cap.release()  # Workers will reopen
-            video_info = {
-                'video_path': input_path,
-                'start_frame': args.skip_first_frames,
-                'frames_to_process': frames_to_process,
-            }
-            result = _gpu_processing(None, device_list, args, video_info=video_info)
-            
-            # Save result
-            if is_png:
-                save_frames_to_image(result, output_path, base_name)
-            else:
-                video_writer = save_frames_to_video(result, output_path, fps, 
-                    video_backend=args.video_backend, use_10bit=args.use_10bit)
-                if video_writer is not None:
-                    video_writer.release()
-            
-            frames_written = result.shape[0]
-        
+            cap.release()
+            def segment_progress(completed, total, index):
+                debug.log(f"Segment {index + 1} saved ({completed}/{total} complete)",
+                          category="generation", force=True)
+
+            frames_written = process_multi_gpu_video(
+                input_path, output_path, fps, args.skip_first_frames,
+                frames_to_process, device_list, args, _process_video_segment,
+                progress=segment_progress,
+            )
+
         # Single GPU: stream in main process
         else:
             chunk_count = 0
@@ -578,11 +568,8 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     frames_tensor, _ = extract_frames_from_image(input_path)
     
     processing_start = time.time()
-    # Process frames (multiprocessing only for multi-GPU)
-    if len(device_list) > 1:
-        result = _gpu_processing(frames_tensor, device_list, args)
-    else:
-        result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
+    # A single image is indivisible; use the first selected GPU.
+    result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
     debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
     
     # Save single image
@@ -701,9 +688,11 @@ def _stream_video_chunks(
             runner_cache=runner_cache
         )
         
-        # Remove context frames from output
-        if context_count > 0:
-            result = result[context_count:]
+        expected = frames.shape[0] + chunk_args.prepend_frames
+        if result.shape[0] != expected:
+            raise RuntimeError(f"Chunk returned {result.shape[0]} frames; expected {expected}")
+        # Strip synthetic start padding, then context; output aligns with new_frames.
+        result = result[chunk_args.prepend_frames + context_count:]
         
         # Save tail for next chunk context
         prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
@@ -712,7 +701,8 @@ def _stream_video_chunks(
         del frames
         
         yield result
-        
+        del result, new_frames
+
         # Memory cleanup between chunks
         if streaming:
             clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
@@ -730,7 +720,8 @@ def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGRA)
     else:
         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(file_path, frame_bgr)
+    if not cv2.imwrite(file_path, frame_bgr):
+        raise RuntimeError(f"Failed to write image: {file_path}")
 
 
 def save_frames_to_video(
@@ -760,8 +751,7 @@ def save_frames_to_video(
     Raises:
         ValueError: If video writer cannot be initialized
     """
-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
-    T, H, W, C = frames_np.shape
+    T, H, W, C = frames_tensor.shape
     
     if writer is None:
         debug.log(f"Saving {T} frames to video: {output_path} (backend={video_backend})", category="file")
@@ -772,14 +762,20 @@ def save_frames_to_video(
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
         if not writer.isOpened():
+            writer.release()
             raise ValueError(f"Cannot create video writer for: {output_path}")
     
-    for i, frame in enumerate(frames_np):
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        writer.write(frame_bgr)
-        if debug.enabled and (i + 1) % 100 == 0:
-            debug.log(f"Written {i + 1}/{T} frames", category="file")
-    
+    try:
+        for i, frame_tensor in enumerate(frames_tensor):
+            frame = (frame_tensor.detach().to(device="cpu", dtype=torch.float32).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            writer.write(frame_bgr)
+            if debug.enabled and (i + 1) % 100 == 0:
+                debug.log(f"Written {i + 1}/{T} frames", category="file")
+    except BaseException:
+        writer.release()
+        raise
+
     return writer  # Caller always closes
 
 
@@ -806,14 +802,14 @@ def save_frames_to_image(
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
-    total = frames_np.shape[0]
+    total = frames_tensor.shape[0]
     
     if start_index == 0:
         debug.log(f"Saving {total} frames as PNGs to directory: {output_dir}", category="file")
     digits = 6  # Supports up to 999,999 frames (~11.5 hours at 24fps)
 
-    for idx, frame in enumerate(frames_np):
+    for idx, frame_tensor in enumerate(frames_tensor):
+        frame = (frame_tensor.detach().to(device="cpu", dtype=torch.float32).numpy() * 255.0).clip(0, 255).astype(np.uint8)
         filename = f"{base_name}_{start_index + idx:0{digits}d}.png"
         file_path = os.path.join(output_dir, filename)
         _save_image_bgr(frame, file_path)
@@ -1012,96 +1008,73 @@ def _process_frames_core(
     return result_tensor
 
 
-def _worker_process(
-    proc_idx: int, 
-    device_id: str, 
-    frames_np: Optional[np.ndarray],
-    shared_args: Dict[str, Any], 
-    return_queue: mp.Queue,
-    done_barrier: mp.Barrier,
-    video_info: Optional[Dict[str, Any]] = None
-) -> None:
+def _process_video_segment(segment, config, state) -> int:
+    """Worker callback: encode one segment, retaining only the current chunk.
+
+    Input context on either side is used for inference and excluded from output.
+    Each worker retains its optional model cache across successive segments.
     """
-    Worker process for multi-GPU upscaling.
-    
-    Supports two modes:
-    1. frames_np provided: Process pre-loaded frames (for images)
-    2. video_info provided: Stream video segment internally (for videos)
-       - Each worker opens the video, seeks to its assigned range, and streams
-         with internal chunking and model caching for memory efficiency
-    
-    Args:
-        proc_idx: Worker index for result ordering
-        device_id: GPU device ID (used for CUDA_VISIBLE_DEVICES inheritance)
-        frames_np: Pre-loaded frames as numpy array, or None for video streaming
-        shared_args: Serialized args namespace as dict
-        return_queue: Queue for returning results to parent
-        done_barrier: Barrier for synchronizing shared memory handoff
-        video_info: Optional dict with 'video_path', 'start_frame', 'end_frame'
-                   for video streaming mode
-    """
-    # Create debug instance for this worker
-    worker_debug = Debug(enabled=shared_args["debug"])
-    
-    args = argparse.Namespace(**shared_args)
-    
-    # Video streaming mode: worker reads and processes its assigned segment
-    if video_info is not None:
-        cap = cv2.VideoCapture(video_info['video_path'])
-        cap.set(cv2.CAP_PROP_POS_FRAMES, video_info['start_frame'])
-        
-        segment_frames = video_info['end_frame'] - video_info['start_frame']
-        chunk_size = args.chunk_size if args.chunk_size > 0 else segment_frames
-        
-        worker_debug.log(f"GPU {proc_idx}: frames {video_info['start_frame']}-{video_info['end_frame']} "
-                        f"({segment_frames} frames, chunks of {chunk_size})",
-                        category="generation", force=True)
-        
-        # Only GPU 0 uses prepend_frames (applies to video start only)
-        worker_args = argparse.Namespace(**vars(args))
-        if proc_idx != 0:
-            worker_args.prepend_frames = 0
-        
-        # Enable model caching within worker only if requested
-        runner_cache = {} if (args.cache_dit or args.cache_vae) else None
-        
-        total_chunks = (segment_frames + chunk_size - 1) // chunk_size
-        results = []
-        for result in _stream_video_chunks(
-            cap=cap,
-            frames_to_process=segment_frames,
-            chunk_size=chunk_size,
-            overlap=args.temporal_overlap,
-            args=worker_args,
-            device_id="0",
-            debug=worker_debug,
-            runner_cache=runner_cache,
-            log_progress=total_chunks > 1,
-            total_chunks=total_chunks,
-            log_prefix=f"[GPU {proc_idx}] "
-        ):
-            results.append(result.cpu())
-        
-        cap.release()
-        result_tensor = torch.cat(results, dim=0) if results else torch.empty(0, dtype=torch.float32)
-    
-    # Pre-loaded frames mode (original behavior)
-    else:
-        frames_tensor = torch.from_numpy(frames_np).to(torch.float16)
-        result_tensor = _process_frames_core(
-            frames_tensor=frames_tensor,
-            args=args,
-            device_id="0",
-            debug=worker_debug,
-            runner_cache=None
+    args = argparse.Namespace(**config["args"])
+    worker_debug = Debug(enabled=args.debug)
+    if segment.index != 0:
+        args.prepend_frames = 0
+    runner_cache = None
+    if args.cache_dit or args.cache_vae:
+        runner_cache = state.setdefault("runner_cache", {})
+    chunk_size = args.chunk_size if args.chunk_size > 0 else max(33, args.batch_size)
+    output_path = str(segment_output_path(config["work_dir"], segment.index, args.output_format))
+    cap = cv2.VideoCapture(config["input_path"])
+    writer = None
+    stream = None
+    written = 0
+    position = segment.read_start
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {config['input_path']}")
+        if segment.read_start and not cap.set(cv2.CAP_PROP_POS_FRAMES, segment.read_start):
+            raise RuntimeError(f"Cannot seek to frame {segment.read_start}")
+        worker_debug.log(
+            f"Segment {segment.index + 1}: output frames {segment.start}-{segment.end}, "
+            f"read {segment.read_start}-{segment.read_end}, chunk_size={chunk_size}",
+            category="generation", force=True,
         )
-    
-    # Share tensor memory for efficient cross-process transfer (avoids pickling large arrays)
-    return_queue.put((proc_idx, result_tensor.share_memory_()))
-    
-    # Wait for parent to copy shared tensors before exiting
-    # (shared memory requires creating process to stay alive during access)
-    done_barrier.wait()
+        stream = _stream_video_chunks(
+            cap=cap, frames_to_process=segment.read_end - segment.read_start,
+            chunk_size=chunk_size, overlap=args.temporal_overlap,
+            args=args, device_id="0", debug=worker_debug, runner_cache=runner_cache,
+        )
+        for result in stream:
+            next_position = position + result.shape[0]
+            keep_start = max(segment.start, position) - position
+            keep_end = min(segment.end, next_position) - position
+            if keep_start < keep_end:
+                kept = result[keep_start:keep_end]
+                if args.output_format == "png":
+                    save_frames_to_image(
+                        kept, output_path, Path(config["input_path"]).stem,
+                        start_index=segment.start - config["start_frame"] + written,
+                    )
+                else:
+                    writer = save_frames_to_video(
+                        kept, output_path, config["fps"], writer=writer,
+                        video_backend=args.video_backend, use_10bit=args.use_10bit,
+                    )
+                written += kept.shape[0]
+                del kept
+            position = next_position
+            del result
+        if position != segment.read_end or written != segment.frame_count:
+            raise RuntimeError(
+                f"Incomplete segment {segment.index}: read through {position} "
+                f"of {segment.read_end}, wrote {written}/{segment.frame_count} frames"
+            )
+    finally:
+        if stream is not None:
+            stream.close()
+        cap.release()
+        if writer is not None:
+            writer.release()
+    return written
 
 
 def _single_gpu_direct_processing(
@@ -1122,170 +1095,6 @@ def _single_gpu_direct_processing(
         debug=debug,
         runner_cache=runner_cache
     )
-
-
-def _gpu_processing(
-    frames_tensor: Optional[torch.Tensor],
-    device_list: List[str], 
-    args: argparse.Namespace,
-    video_info: Optional[Dict[str, Any]] = None
-) -> torch.Tensor:
-    """
-    Orchestrate multi-GPU parallel video upscaling with temporal overlap blending.
-    
-    Supports two modes:
-    1. video_info provided: Workers stream their assigned video segments internally
-       (each GPU reads and processes its frame range with internal chunking)
-    2. frames_tensor provided: Workers process pre-loaded frame chunks
-       (non streaming behavior for images or pre-loaded videos)
-    
-    Args:
-        frames_tensor: Input frames [T, H, W, C] or None if using video_info mode
-        device_list: List of device IDs as strings (e.g., ["0", "1"])
-        args: Parsed command-line arguments containing all processing settings
-        video_info: Optional dict with 'video_path', 'start_frame', 'frames_to_process'
-                   for streaming mode where workers read video directly
-    
-    Returns:
-        Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
-    """
-    num_devices = len(device_list)
-    overlap = args.temporal_overlap
-    
-    return_queue = mp.Queue(maxsize=0)
-    done_barrier = mp.Barrier(num_devices + 1)
-    workers = []
-    shared_args = vars(args).copy()
-    
-    # Video streaming mode: distribute frame ranges to workers
-    if video_info is not None:
-        total_frames = video_info['frames_to_process']
-        start_frame = video_info['start_frame']
-        video_path = video_info['video_path']
-        
-        base_per_gpu = total_frames // num_devices
-        remainder = total_frames % num_devices
-        
-        current_start = start_frame
-        for idx, device_id in enumerate(device_list):
-            gpu_frames = base_per_gpu + (1 if idx < remainder else 0)
-            gpu_end = current_start + gpu_frames
-            
-            # Add overlap frames for blending (except last GPU)
-            if idx < num_devices - 1 and overlap > 0:
-                gpu_end = min(gpu_end + overlap, start_frame + total_frames)
-            
-            worker_video_info = {
-                'video_path': video_path,
-                'start_frame': current_start,
-                'end_frame': gpu_end,
-            }
-            
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
-            p = mp.Process(
-                target=_worker_process,
-                args=(idx, device_id, None, shared_args, return_queue, done_barrier),
-                kwargs={'video_info': worker_video_info}
-            )
-            p.start()
-            workers.append(p)
-            
-            current_start += gpu_frames
-    
-    # Pre-loaded frames mode (original behavior for images or non-streaming)
-    else:
-        total_frames = frames_tensor.shape[0]
-        
-        if overlap > 0 and num_devices > 1:
-            chunk_with_overlap = total_frames // num_devices + overlap
-            if args.batch_size > 1:
-                chunk_with_overlap = ((chunk_with_overlap + args.batch_size - 1) // args.batch_size) * args.batch_size
-            base_chunk_size = chunk_with_overlap - overlap
-
-            chunks = []
-            for i in range(num_devices):
-                start_idx = i * base_chunk_size
-                if i == num_devices - 1:
-                    end_idx = total_frames
-                else:
-                    end_idx = min(start_idx + chunk_with_overlap, total_frames)
-                chunks.append(frames_tensor[start_idx:end_idx])
-        else:
-            chunks = torch.chunk(frames_tensor, num_devices, dim=0)
-
-        for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
-            p = mp.Process(
-                target=_worker_process,
-                args=(idx, device_id, chunk_tensor.cpu().numpy(), shared_args, return_queue, done_barrier),
-            )
-            p.start()
-            workers.append(p)
-
-    # Collect results before joining to prevent deadlock
-    # Tensors arrive via shared memory - copy to numpy while workers still alive
-    results_np = [None] * num_devices
-    collected = 0
-    while collected < num_devices:
-        proc_idx, result_tensor = return_queue.get()
-        results_np[proc_idx] = result_tensor.numpy()
-        collected += 1
-    
-    # Release workers now that shared tensors are copied
-    done_barrier.wait()
-    
-    # Now safe to join
-    for p in workers:
-        p.join()
-
-    # Concatenate results with overlap blending using shared function
-    if args.temporal_overlap > 0 and num_devices > 1:        
-        overlap = args.temporal_overlap
-        result_tensor = None
-        
-        for idx, res_np in enumerate(results_np):
-            chunk_tensor = torch.from_numpy(res_np).to(torch.float32)
-            
-            if idx == 0:
-                # First chunk: keep all frames
-                result_tensor = chunk_tensor
-            else:
-                # Subsequent chunks: blend overlapping region with accumulated result
-                if chunk_tensor.shape[0] > overlap and result_tensor.shape[0] >= overlap:
-                    # Get overlapping regions
-                    prev_tail = result_tensor[-overlap:]  # Last N frames from accumulated result
-                    cur_head = chunk_tensor[:overlap]      # First N frames from current chunk
-                    
-                    # Blend using shared function
-                    blended = blend_overlapping_frames(prev_tail, cur_head, overlap)
-                    
-                    # Replace tail of result with blended frames, then append rest of chunk
-                    result_tensor = torch.cat([
-                        result_tensor[:-overlap],           # Everything except the tail
-                        blended,                            # Blended overlapping frames
-                        chunk_tensor[overlap:]              # Non-overlapping part of current chunk
-                    ], dim=0)
-                else:
-                    # Edge case: chunk too small, just append non-overlapping part
-                    if chunk_tensor.shape[0] > overlap:
-                        result_tensor = torch.cat([result_tensor, chunk_tensor[overlap:]], dim=0)
-        
-        if result_tensor is None:
-            result_tensor = torch.from_numpy(results_np[0]).to(torch.float32)
-    else:
-        # Simple concatenation without overlap
-        result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0)).to(torch.float32)
-
-    # Handle prepend_frames removal (multi-GPU safe - done after all workers complete)
-    if args.prepend_frames > 0:
-        if args.prepend_frames < result_tensor.shape[0]:
-            debug.log(f"Removing {args.prepend_frames} prepended frames from output", category="generation")
-            result_tensor = result_tensor[args.prepend_frames:]
-        else:
-            debug.log(f"prepend_frames ({args.prepend_frames}) >= total frames ({result_tensor.shape[0]}), skipping removal", 
-                     level="WARNING", category="generation", force=True)
-    
-    return result_tensor
 
 
 # =============================================================================
@@ -1323,8 +1132,8 @@ Examples:
   Streaming mode for long videos with 10-bit video output (requires FFMPEG):
     python {invocation} long_video.mp4 --resolution 1080 --batch_size 33 --chunk_size 330 --temporal_overlap 3 --video_backend ffmpeg --10bit
 
-  Multi-GPU processing with temporal overlap:
-    python {invocation} video.mp4 --cuda_device 0,1 --resolution 1080 --batch_size 81 --uniform_batch_size --temporal_overlap 3 --prepend_frames 4 
+  Multi-GPU disk-backed segments (requires FFMPEG):
+    python {invocation} video.mp4 --cuda_device 0,1 --segment_duration 60 --segment_overlap 4 --chunk_size 81 --batch_size 33 --cache_dit --cache_vae --video_backend ffmpeg
 
   Memory-optimized for low VRAM (8GB):
     python {invocation} image.png --dit_model seedvr2_ema_3b-Q8_0.gguf --blocks_to_swap 32 --swap_io_components --dit_offload_device cpu --vae_offload_device cpu
@@ -1386,11 +1195,18 @@ Examples:
                         help="Load maximum N frames from video. 0 = load all (default: 0)")
     process_group.add_argument("--chunk_size", type=int, default=0,
                         help="Frames per chunk for streaming mode. When > 0, processes video in "
-                             "memory-bounded chunks of N frames. 0 = load all frames at once (default: 0)")
+                             "memory-bounded chunks of N frames. 0 = whole video on single GPU; "
+                             "multi-GPU automatically uses max(33, batch_size) (default: 0)")
+    process_group.add_argument("--segment_duration", type=float, default=60.0,
+                        help="Multi-GPU task duration in seconds (default: 60). Each task streams "
+                             "chunk_size frames at a time into an encoded segment on disk.")
+    process_group.add_argument("--segment_overlap", type=int, default=4,
+                        help="Extra input context frames on each side of multi-GPU segments "
+                             "(default: 4). Cropped before encoding; no cross-segment blending.")
     process_group.add_argument("--prepend_frames", type=int, default=0,
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
     process_group.add_argument("--temporal_overlap", type=int, default=0,
-                        help="Frames to overlap between batches/GPUs for smooth blending (default: 0)")
+                        help="Overlap frames for within-chunk batch blending and context between chunks (default: 0)")
     
     # Quality Control
     quality_group = parser.add_argument_group('Quality control')
@@ -1470,10 +1286,10 @@ Examples:
     cache_group = parser.add_argument_group('Model caching (batch processing)')
     cache_group.add_argument("--cache_dit", action="store_true",
                         help="Keep DiT model in memory between generations. Works with single-GPU directory processing "
-                             "or multi-GPU streaming (--chunk_size). Requires --dit_offload_device")
+                             "or multi-GPU segments. Requires --dit_offload_device")
     cache_group.add_argument("--cache_vae", action="store_true",
                         help="Keep VAE model in memory between generations. Works with single-GPU directory processing "
-                             "or multi-GPU streaming (--chunk_size). Requires --vae_offload_device")
+                             "or multi-GPU segments. Requires --vae_offload_device")
     
     # Debugging
     debug_group = parser.add_argument_group('Debugging')
@@ -1484,7 +1300,18 @@ Examples:
     if len(sys.argv) == 1:
         sys.argv.append('--help')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not math.isfinite(args.segment_duration) or args.segment_duration <= 0:
+        parser.error("--segment_duration must be finite and positive")
+    for name in ("chunk_size", "segment_overlap", "temporal_overlap", "prepend_frames",
+                 "skip_first_frames", "load_cap"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name} must be non-negative")
+    if args.batch_size <= 0:
+        parser.error("--batch_size must be positive")
+    if args.use_10bit and args.video_backend != "ffmpeg":
+        parser.error("--10bit requires --video_backend ffmpeg")
+    return args
 
 
 # =============================================================================
@@ -1579,14 +1406,18 @@ def main() -> None:
         if args.debug:
             debug.log(f"Using devices: {device_list}", category="device")
         
+        if not device_list or len(set(device_list)) != len(device_list):
+            raise ValueError("Specify at least one GPU, without duplicate device IDs")
+        input_type = get_input_type(args.input)
+        if (len(device_list) > 1 and args.output_format != "png"
+                and input_type == "video" and shutil.which("ffmpeg") is None):
+            raise RuntimeError("Multi-GPU MP4 output requires ffmpeg in PATH for segment merging")
+
         # Download models once before processing
         if not download_weight(dit_model=args.dit_model, vae_model=DEFAULT_VAE, model_dir=args.model_dir, debug=debug):
             debug.log("Failed to download required models. Check console output above.", level="ERROR", category="download", force=True)
             sys.exit(1)
         
-        # Determine input type and process accordingly
-        input_type = get_input_type(args.input)
-
         # Track total frames for FPS calculation (time tracked via start_time)
         total_frames_processed = 0
         
@@ -1601,16 +1432,6 @@ def main() -> None:
                 sys.exit(1)
             
             debug.log(f"Found {len(media_files)} media files to process", category="file", force=True)
-            
-            # Multi-GPU caching requires streaming (workers cache within their chunk loops)
-            if (args.cache_dit or args.cache_vae) and len(device_list) > 1 and args.chunk_size <= 0:
-                debug.log(
-                    "Model caching requires streaming mode (--chunk_size > 0) for multi-GPU. "
-                    "Disabling caching for this run.",
-                    level="WARNING", category="cache", force=True
-                )
-                args.cache_dit = False
-                args.cache_vae = False
             
             # Single-GPU: runner_cache persists across files; multi-GPU: workers cache internally
             runner_cache = {} if (args.cache_dit or args.cache_vae) and len(device_list) == 1 else None
@@ -1657,17 +1478,9 @@ def main() -> None:
             runner_cache = None
             streaming = args.chunk_size > 0
             
-            if args.cache_dit or args.cache_vae:
-                if len(device_list) > 1:
-                    if not streaming:
-                        debug.log(
-                            "Model caching requires streaming mode (--chunk_size > 0) for multi-GPU. "
-                            "Disabling caching for this run.",
-                            level="WARNING", category="cache", force=True
-                        )
-                        args.cache_dit = False
-                        args.cache_vae = False
-                elif streaming:
+            # Multi-GPU caches are owned by the persistent segment workers.
+            if len(device_list) == 1 and (args.cache_dit or args.cache_vae):
+                if streaming:
                     runner_cache = {}
                 else:
                     debug.log(

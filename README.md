@@ -6,6 +6,8 @@ Official release of [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) for Comf
 
 Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#-run-as-standalone-cli) section.
 
+**This fork:** Multi-GPU video output now uses 60-second disk-backed segments with bounded internal chunks. See [多 GPU 分段处理说明](docs/MULTI_GPU_STREAMING.md) for the new workflow and parameters.
+
 [![SeedVR2 v2.5 Deep Dive Tutorial](https://img.youtube.com/vi/MBtWYXq_r60/maxresdefault.jpg)](https://youtu.be/MBtWYXq_r60)
 
 ![Usage Example](docs/usage_01.png)
@@ -317,7 +319,7 @@ We're actively working on improvements and new features. To stay informed:
 
 ### Performance Features
 - **torch.compile Integration**: Optional 20-40% DiT speedup and 15-25% VAE speedup with PyTorch 2.0+ compilation
-- **Multi-GPU CLI**: Distribute workload across multiple GPUs with automatic temporal overlap blending
+- **Multi-GPU CLI**: Schedule video segments across persistent GPU workers, encode incrementally, and merge encoded files with FFmpeg
 - **Model Caching**: Keep models loaded between generations for single-GPU directory processing or multi-GPU streaming
 - **Flexible Attention Backends**: Choose between PyTorch SDPA (stable, always available), Flash Attention 2/3, or SageAttention 2/3 for faster computation on supported hardware
 
@@ -837,7 +839,7 @@ python inference_cli.py video.mp4 --resolution 720 --batch_size 33
 
 # Streaming mode for long videos (memory-efficient) with 10-bit video output (requires FFMPEG)
 # Processes video in chunks of 330 frames to avoid loading entire video into RAM
-# Use --temporal_overlap to ensure smooth transitions between chunks
+# Use --temporal_overlap to provide context between chunks
 python inference_cli.py long_video.mp4 \
     --resolution 1080 \
     --batch_size 33 \
@@ -846,14 +848,18 @@ python inference_cli.py long_video.mp4 \
     --video_backend ffmpeg \
     --10bit
 
-# Multi-GPU processing with temporal overlap
+# Multi-GPU: 60-second tasks, bounded chunks, context cropped at segment boundaries
 python inference_cli.py video.mp4 \
     --cuda_device 0,1 \
     --resolution 1080 \
-    --batch_size 81 \
+    --segment_duration 60 \
+    --segment_overlap 4 \
+    --chunk_size 81 \
+    --batch_size 33 \
     --uniform_batch_size \
     --temporal_overlap 3 \
-    --prepend_frames 4
+    --cache_dit --cache_vae \
+    --video_backend ffmpeg
 
 # Memory-optimized for low VRAM (8GB)
 python inference_cli.py image.png \
@@ -905,9 +911,11 @@ python inference_cli.py media_folder/ \
 - `--seed`: Random seed for reproducibility (default: 42)
 - `--skip_first_frames`: Skip N initial frames (default: 0)
 - `--load_cap`: Maximum total frames to load from video. 0 = load all (default: 0)
-- `--chunk_size`: Frames per chunk for streaming mode. When > 0, processes video in memory-bounded chunks of N frames, writing each chunk before loading the next. Essential for long videos that would otherwise exceed RAM. Use with `--temporal_overlap` for seamless chunk transitions. 0 = load all frames at once (default: 0)
+- `--chunk_size`: New frames per inference chunk, written before processing the next chunk. In single-GPU mode, 0 loads the whole video. In multi-GPU mode, 0 automatically uses `max(33, batch_size)`; an explicit positive value overrides this. Context and prepend frames add to the inference input size.
+- `--segment_duration`: Multi-GPU task length in seconds (default: 60). Each task encodes a video segment incrementally; this does not determine how many frames are held in RAM.
+- `--segment_overlap`: Extra input context frames on each side of a multi-GPU segment (default: 4). These are cropped before encoding. This is context-and-trim, not cross-segment output blending.
 - `--prepend_frames`: Prepend N reversed frames to reduce start artifacts (auto-removed) (default: 0)
-- `--temporal_overlap`: Frames to overlap between batches/GPUs for smooth blending (default: 0)
+- `--temporal_overlap`: Overlap for batch blending within an inference chunk and input context between chunks (default: 0). Segment context is controlled separately by `--segment_overlap`.
 
 **Quality Control:**
 - `--color_correction`: Color correction method: 'lab' (perceptual, recommended), 'wavelet', 'wavelet_adaptive', 'hsv', 'adain', or 'none' (default: lab)
@@ -942,8 +950,8 @@ python inference_cli.py media_folder/ \
 - `--compile_dynamo_recompile_limit`: Max recompilation attempts before fallback (default: 128)
 
 **Model Caching (batch processing):**
-- `--cache_dit`: Keep DiT model in memory between generations. Works with single-GPU directory processing or multi-GPU streaming (`--chunk_size`). Requires `--dit_offload_device`
-- `--cache_vae`: Keep VAE model in memory between generations. Works with single-GPU directory processing or multi-GPU streaming (`--chunk_size`). Requires `--vae_offload_device`
+- `--cache_dit`: Keep DiT model in memory between generations. Works with single-GPU directory processing or across chunks and segments in a persistent multi-GPU worker. Offload defaults to CPU when enabled
+- `--cache_vae`: Keep VAE model in memory between generations. Works with single-GPU directory processing or across chunks and segments in a persistent multi-GPU worker. Offload defaults to CPU when enabled
 
 **Multi-GPU:**
 - `--cuda_device`: CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU
@@ -953,40 +961,27 @@ python inference_cli.py media_folder/ \
 
 ### Multi-GPU Processing Explained
 
-The CLI's multi-GPU mode uses **frame-level parallelism**: the video is split into chunks and each GPU processes its chunk independently through all 4 phases (encode → upscale → decode → postprocess). This is ideal for long videos where you want to reduce total processing time by dividing the workload.
+Multi-GPU video processing uses persistent workers and encoded segment files:
 
-**How it works:**
-1. Video frames are split evenly across GPUs (e.g., 100 frames on 2 GPUs → 50 frames each)
-2. Each GPU loads its own copy of the models and processes its chunk independently
-3. When `--temporal_overlap` is set, chunks include overlapping frames for seamless blending
-4. Results are concatenated (and blended at overlap regions) into the final video
+1. Plan disjoint output ranges of `--segment_duration` seconds (default: 60).
+2. Add up to `--segment_overlap` context frames before and after each range, bounded by the selected input range.
+3. Each GPU takes a task, reads at most `--chunk_size` new frames at a time, upscales them, crops context, and immediately writes the retained frames to a segment file.
+4. A finished GPU takes the next task. With `--cache_dit --cache_vae`, its models are reused across chunks and tasks within the same input video.
+5. FFmpeg concatenates the encoded segments in order using video stream copy. Source audio from the selected time range is included and encoded as AAC when present.
 
-**Example for 100 frames on 2 GPUs with temporal_overlap=4:**
-```
-GPU 0: Frames 0-53 (50 base + 4 overlap at end, processed as independent video)
-GPU 1: Frames 50-99 (50 frames, 4 overlap at start, processed as independent video)
-Result: Frames 0-99 with smooth blending at the transition point
-```
+Only frame ranges and completion metadata cross process queues. Workers never accumulate all output chunks, and the parent never receives a complete video tensor. Frame format conversion uses one frame at a time. Peak tensor memory depends on active workers, inference chunk size, resolution, context, and model settings, rather than video duration. Encoded files and filesystem cache still consume disk space / system resources.
 
-**Important considerations:**
-- Each GPU processes its chunk as a separate video with its own batch splitting
-- `batch_size` controls batching *within* each GPU's chunk, not across GPUs
-- For short videos (< 100 frames), single GPU is often more efficient due to model loading overhead
-- Multi-GPU doubles VRAM usage (each GPU loads full models) but roughly halves processing time
+**Requirements and behavior:**
 
-**When to use multi-GPU:**
-- Long videos (100+ frames) where splitting provides significant time savings
-- When you have multiple GPUs with sufficient VRAM each
-
-**When to use single GPU:**
-- Short videos where model loading overhead outweighs parallel gains
-- When you want all frames processed together for maximum temporal coherence
-
-**Best practices:**
-- Set `--temporal_overlap` to 2-4 frames for smooth blending between GPU chunks
-- Higher overlap = smoother transitions but more redundant processing
-- Use `--prepend_frames` to reduce artifacts at video start
-- For optimal quality on short videos, use single GPU with `batch_size` matching your shot length
+- MP4 output requires `ffmpeg` in PATH even when segment encoding uses `--video_backend opencv`. PNG output does not require FFmpeg.
+- Each GPU loads its own models. Use fewer devices or a smaller `--chunk_size` to lower aggregate RAM usage.
+- At most one task runs per selected GPU. A video shorter than `--segment_duration` creates one task; reduce the duration to distribute a short clip across more GPUs.
+- `--batch_size` remains the model's internal frame batch size. `--chunk_size` controls the amount processed before writing, and `--segment_duration` controls scheduling / file boundaries.
+- Segment context is cropped, not blended. No frames are duplicated at joins, but independently generated segments may still show a visual change. Test boundary quality on your footage.
+- Input timing follows the existing OpenCV constant-FPS pipeline; variable-frame-rate timestamps are not preserved.
+- Temporary `.seedvr2-segments-*` directories sit beside the output. Allow disk space for both the encoded segments and final video. On success they are removed; on failure they are retained with a frame-range manifest and diagnostics. Automatic resume is not implemented.
+- The final MP4 replaces the destination only after a successful merge. Existing output remains intact if processing or merging fails.
+- Single-image inputs use the first selected GPU. ComfyUI nodes are unaffected.
 
 ## ⚠️ Limitations
 
