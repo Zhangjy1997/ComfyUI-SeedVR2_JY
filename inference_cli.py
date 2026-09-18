@@ -154,7 +154,7 @@ class FFMPEGVideoWriter:
         height: Frame height in pixels
         fps: Frames per second
         use_10bit: If True, uses x265 codec with yuv420p10le pixel format.
-                   If False, uses x264 with yuv420p (default: False)
+                   If False, uses x265 with yuv420p (default: False)
     
     Raises:
         RuntimeError: If ffmpeg is not found in system PATH
@@ -166,7 +166,7 @@ class FFMPEGVideoWriter:
     
     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False):
         pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
-        codec = 'libx265' if use_10bit else 'libx264'
+        codec = 'libx265'
         
         self.proc = subprocess.Popen(
             ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
@@ -1140,7 +1140,7 @@ Examples:
     python {invocation} long_video.mp4 --resolution 1080 --batch_size 33 --chunk_size 330 --temporal_overlap 3 --video_backend ffmpeg --10bit
 
   Multi-GPU disk-backed segments (requires FFMPEG):
-    python {invocation} video.mp4 --cuda_device 0,1 --segment_duration 60 --segment_overlap 4 --chunk_size 81 --batch_size 33 --cache_dit --cache_vae --video_backend ffmpeg
+    python {invocation} video.mp4 --cuda_device 0,1 --segment_duration 60 --segment_overlap 16 --chunk_size 81 --batch_size 33 --cache_dit --cache_vae --video_backend ffmpeg
 
   Memory-optimized for low VRAM (8GB):
     python {invocation} image.png --dit_model seedvr2_ema_3b-Q8_0.gguf --blocks_to_swap 32 --swap_io_components --dit_offload_device cpu --vae_offload_device cpu
@@ -1171,7 +1171,7 @@ Examples:
                         help="Video encoder backend: 'opencv' (default) or 'ffmpeg' (requires ffmpeg in PATH)")
     io_group.add_argument("--10bit", dest="use_10bit", action="store_true",
                         help="Save 10-bit video with x265 codec (reduces banding). Without this flag, "
-                         "ffmpeg uses x264 for maximum compatibility. Requires --video_backend ffmpeg")
+                         "ffmpeg uses 8-bit x265 (yuv420p). Requires --video_backend ffmpeg")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     
@@ -1207,9 +1207,9 @@ Examples:
     process_group.add_argument("--segment_duration", type=float, default=60.0,
                         help="Time window in seconds (default: 60). Every window is split across all "
                              "selected GPUs and saved before starting the next window.")
-    process_group.add_argument("--segment_overlap", type=int, default=4,
+    process_group.add_argument("--segment_overlap", type=int, default=16,
                         help="Extra context frames at GPU subsegment and time-window boundaries "
-                             "(default: 4). Cropped before encoding; no cross-segment blending.")
+                             "(default: 16). Cropped before encoding; no cross-segment blending.")
     process_group.add_argument("--prepend_frames", type=int, default=0,
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
     process_group.add_argument("--temporal_overlap", type=int, default=0,

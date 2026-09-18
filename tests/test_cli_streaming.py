@@ -327,7 +327,7 @@ class VideoTests(unittest.TestCase):
         with patch.object(sys, "argv", ["inference_cli.py", "input.mp4"]):
             args = self.io["parse_arguments"]()
             self.assertEqual(args.segment_duration, 60)
-            self.assertEqual(args.segment_overlap, 4)
+            self.assertEqual(args.segment_overlap, 16)
         for option, value in (("--segment_duration", "nan"), ("--chunk_size", "-1")):
             with patch.object(sys, "argv", ["inference_cli.py", "input.mp4", option, value]):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

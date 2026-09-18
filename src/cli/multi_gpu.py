@@ -32,7 +32,7 @@ class VideoSegment:
         return self.end - self.start
 
 
-def plan_segments(start_frame, frame_count, fps, duration=60.0, overlap=4):
+def plan_segments(start_frame, frame_count, fps, duration=60.0, overlap=16):
     """Plan disjoint output ranges with extra input context on both sides."""
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("Video FPS must be finite and positive")
@@ -50,7 +50,7 @@ def plan_segments(start_frame, frame_count, fps, duration=60.0, overlap=4):
     ]
 
 
-def plan_gpu_segments(windows, device_count, overlap=4):
+def plan_gpu_segments(windows, device_count, overlap=16):
     """Split every time window evenly across all available GPU slots.
 
     Global task IDs keep filenames unique across windows. Context can extend
@@ -110,7 +110,7 @@ def run_segment_workers(windows, devices, process_segment, config, progress=None
         return 0
     if not devices or len(set(devices)) != len(devices):
         raise ValueError("Specify at least one GPU, without duplicate device IDs")
-    overlap = config.get("args", {}).get("segment_overlap", 4)
+    overlap = config.get("args", {}).get("segment_overlap", 16)
     groups = plan_gpu_segments(windows, len(devices), overlap)
     worker_count = max(len(group) for group in groups)
     context = mp.get_context("spawn")

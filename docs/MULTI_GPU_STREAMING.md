@@ -33,7 +33,7 @@ python inference_cli.py input.mp4 \
 | 参数 | 含义 | 默认值 |
 | --- | --- | --- |
 | `--segment_duration` | 每轮由全部 GPU 共同处理的视频时长，单位秒 | 60 |
-| `--segment_overlap` | GPU 子段及分钟边界额外读取的上下文帧数，编码前裁掉 | 4 |
+| `--segment_overlap` | GPU 子段及分钟边界额外读取的上下文帧数，编码前裁掉 | 16 |
 | `--chunk_size` | 每次推理新读入的帧数，处理后立即写入片段视频 | 多卡为 `max(33, batch_size)`；显式设置优先 |
 | `--batch_size` | 模型内部一次处理的帧数 | 5 |
 | `--temporal_overlap` | 同一推理块内批次的融合，以及小块之间的输入上下文 | 0 |

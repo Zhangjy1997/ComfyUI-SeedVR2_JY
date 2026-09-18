@@ -853,7 +853,7 @@ python inference_cli.py video.mp4 \
     --cuda_device 0,1 \
     --resolution 1080 \
     --segment_duration 60 \
-    --segment_overlap 4 \
+    --segment_overlap 16 \
     --chunk_size 81 \
     --batch_size 33 \
     --uniform_batch_size \
@@ -898,7 +898,7 @@ python inference_cli.py media_folder/ \
 - `--output`: Output path (default: auto-generated in 'output/' directory)
 - `--output_format`: Output format: 'mp4' (video) or 'png' (image sequence). Default: auto-detect from input type
 - `--video_backend`: Video encoder backend: 'opencv' (default) or 'ffmpeg' (requires ffmpeg in PATH)
-- `--10bit`: Save 10-bit video with x265 codec and yuv420p10le pixel format (reduces banding in gradients). Without this flag, ffmpeg uses x264 (yuv420p) for maximum compatibility. Requires --video_backend ffmpeg
+- `--10bit`: Save 10-bit video with x265 codec and yuv420p10le pixel format (reduces banding in gradients). Without this flag, ffmpeg uses 8-bit x265 (yuv420p). Requires --video_backend ffmpeg
 - `--model_dir`: Model directory (default: ./models/SEEDVR2)
 
 **Model Selection:**
@@ -913,7 +913,7 @@ python inference_cli.py media_folder/ \
 - `--load_cap`: Maximum total frames to load from video. 0 = load all (default: 0)
 - `--chunk_size`: New frames per inference chunk, written before processing the next chunk. In single-GPU mode, 0 loads the whole video. In multi-GPU mode, 0 automatically uses `max(33, batch_size)`; an explicit positive value overrides this. Context and prepend frames add to the inference input size.
 - `--segment_duration`: Time-window length in seconds (default: 60). Every window is split across all selected GPUs, encoded incrementally and assembled before the next window starts.
-- `--segment_overlap`: Extra input context frames at GPU subsegment and time-window boundaries (default: 4). These are cropped before encoding. This is context-and-trim, not cross-segment output blending.
+- `--segment_overlap`: Extra input context frames at GPU subsegment and time-window boundaries (default: 16). These are cropped before encoding. This is context-and-trim, not cross-segment output blending.
 - `--prepend_frames`: Prepend N reversed frames to reduce start artifacts (auto-removed) (default: 0)
 - `--temporal_overlap`: Overlap for batch blending within an inference chunk and input context between chunks (default: 0). Segment context is controlled separately by `--segment_overlap`.
 
